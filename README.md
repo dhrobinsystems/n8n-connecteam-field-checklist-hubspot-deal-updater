@@ -43,6 +43,8 @@ This workflow closes that gap. It acts on the checklist the moment it's submitte
 
 ## 2. Architecture
 
+![Workflow Overview](https://raw.githubusercontent.com/dhrobinsystems/n8n-connecteam-field-checklist-hubspot-deal-updater/main/workflow-overview.png)
+
 ```mermaid
 flowchart TD
     A[Connecteam Webhook Trigger<br/>form_submission · pinned fixtures] --> B[Verify Secret & Normalize Event<br/>x-webhook-secret · dedupe · answers · media]
