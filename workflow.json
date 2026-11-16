@@ -1,0 +1,2598 @@
+{
+  "name": "n8n-connecteam-field-checklist-hubspot-deal-updater",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "connecteam-checklist-submitted",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "8420fcf3-38cc-55fd-bd56-f589cdccb292",
+      "name": "Connecteam Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "00000000-0000-4000-8000-0000000000c6",
+      "notes": "Connecteam Forms webhook (form_submission). Pinned fictional pre-start, safety and job-completion submissions included."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Verify Secret & Normalize Event      Mode: Run Once for All Items\n// Repo: n8n-connecteam-field-checklist-hubspot-deal-updater · dhRobin Systems\n// Authentication (fails closed):\n//   header_secret (default) Connecteam sends the webhook's secretKey verbatim\n//                           in `x-webhook-secret`; compared in constant time.\n//   hmac_sha256             For deliveries re-signed by a gateway/relay:\n//                           HMAC-SHA256(raw body) in CONNECTEAM_SIGNATURE_HEADER.\n// Then: only configured checklist forms, only processed event types, and\n// each formSubmissionId at most once (retries and duplicates are ignored).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst helpers = this.helpers;\nlet crypto = null;\ntry { crypto = require('crypto'); } catch (error) { crypto = null; }\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst PERSIST = !SANDBOX_MODE && !DRY_RUN;\nconst AUTH_MODE = env('CONNECTEAM_AUTH_MODE', 'header_secret').toLowerCase();\nconst SECRET_HEADER = env('CONNECTEAM_SECRET_HEADER', 'x-webhook-secret').toLowerCase();\nconst SIG_HEADER = env('CONNECTEAM_SIGNATURE_HEADER', 'x-signature').toLowerCase();\nconst SANDBOX_SECRET = 'sandbox-fictional-connecteam-secret-not-for-production';\nconst SECRET = env('CONNECTEAM_WEBHOOK_SECRET', '') || (SANDBOX_MODE ? SANDBOX_SECRET : '');\nconst EVENT_TYPES = new Set(csv('PROCESS_EVENT_TYPES', 'form_submission'));\nconst YES_INDEX = num('YES_NO_YES_INDEX', 0);\nconst DEDUPE_DAYS = Math.max(1, num('SUBMISSION_LEDGER_DAYS', 30));\n\nlet runId;\ntry { runId = 'chk_' + crypto.randomUUID(); } catch (error) { runId = 'chk_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }\nconst run = { runId, startedAt: new Date().toISOString(), mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live', sandboxMode: SANDBOX_MODE, dryRun: DRY_RUN };\n\nconst items = $input.all();\nconst sharedFixtures = SANDBOX_MODE ? (items.find((i) => i.json.sandboxFixtures) || { json: {} }).json.sandboxFixtures || null : null;\n\nlet FORMS = {};\ntry { FORMS = JSON.parse(env('CHECKLIST_FORMS_JSON', '')) || {}; } catch (e) { FORMS = {}; }\nif (SANDBOX_MODE && !Object.keys(FORMS).length && sharedFixtures) FORMS = sharedFixtures.formConfig || {};\n\nconst sha = (s) => crypto.createHash('sha256').update(String(s)).digest();\nconst safeEqual = (a, b) => !!crypto && typeof a === 'string' && typeof b === 'string' && a.length > 0 && b.length > 0 && crypto.timingSafeEqual(sha(a), sha(b));\n\nfunction authenticate(headers, raw) {\n  if (!SECRET) return { ok: false, reason: 'webhook_secret_not_configured' };\n  if (!crypto) return { ok: false, reason: 'crypto_module_unavailable' };\n  if (AUTH_MODE === 'hmac_sha256') {\n    const provided = String(headers[SIG_HEADER] || '').replace(/^sha256=/i, '');\n    const mac = crypto.createHmac('sha256', SECRET).update(raw, 'utf8');\n    const digest = mac.digest();\n    const ok = safeEqual(provided, digest.toString('hex')) || safeEqual(provided, digest.toString('base64'));\n    return ok ? { ok: true, method: 'hmac_sha256' } : { ok: false, method: 'hmac_sha256', reason: provided ? 'signature_mismatch' : 'signature_header_missing' };\n  }\n  const provided = headers[SECRET_HEADER] || '';\n  if (!provided) return { ok: false, method: 'header_secret', reason: 'secret_header_missing' };\n  return safeEqual(provided, SECRET) ? { ok: true, method: 'header_secret' } : { ok: false, method: 'header_secret', reason: 'secret_mismatch' };\n}\n\nconst toMs = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? (n < 1e12 ? n * 1000 : n) : null; };\nconst MEDIA_KIND = { signature: 'signature', image: 'photo', scanDocument: 'scan', video: 'video', audioRecording: 'audio', files: 'file' };\n\nfunction normalizeAnswer(a, prefix = '') {\n  if (!a || typeof a !== 'object') return [];\n  const type = String(a.questionType || 'unknown');\n  const base = { questionId: String(a.questionId ?? ''), questionType: type, path: prefix, hidden: !!a.wasHidden, empty: !!a.wasSubmittedEmpty, hasLocation: !!a.location, value: null, positive: null, media: [] };\n  switch (type) {\n    case 'group':\n      return (a.answers || []).flatMap((x) => normalizeAnswer(x, `${prefix}${base.questionId}/`));\n    case 'multiGroup':\n      return (a.groupAnswers || []).flatMap((g, i) => (Array.isArray(g) ? g : (g && g.answers) || []).flatMap((x) => normalizeAnswer(x, `${prefix}${base.questionId}#${i + 1}/`)));\n    case 'description':\n      return [];\n    case 'multipleChoice': case 'imageSelection': case 'dropdown':\n      base.value = (a.selectedAnswers || []).map((s) => s && (s.text ?? s.label)).filter(Boolean).join(', ') || null; break;\n    case 'yesNo':\n      if (Number.isInteger(a.selectedIndex)) { base.positive = a.selectedIndex === YES_INDEX; base.value = base.positive ? 'Yes' : 'No'; } break;\n    case 'task':\n      if (typeof a.isChecked === 'boolean') { base.positive = a.isChecked; base.value = a.isChecked ? 'Done' : 'Not done'; } break;\n    case 'openEnded': case 'emailAddress': case 'phoneNumber':\n      base.value = a.value != null && String(a.value).trim() !== '' ? String(a.value).trim().slice(0, 2000) : null; break;\n    case 'number': base.value = a.inputValue != null ? String(a.inputValue) : null; break;\n    case 'rating': base.value = a.ratingValue != null ? String(a.ratingValue) : null; break;\n    case 'slider': base.value = a.value != null ? String(a.value) : null; break;\n    case 'formula': base.value = a.result != null ? String(a.result) : null; break;\n    case 'datetime': base.value = toMs(a.timestamp) ? new Date(toMs(a.timestamp)).toISOString() : null; base.timezone = a.timezone || null; break;\n    case 'location': base.value = a.locationInput && a.locationInput.address ? String(a.locationInput.address).slice(0, 300) : null; break;\n    case 'signature': case 'image': case 'scanDocument':\n      base.media = (a.images || []).filter((m) => m && m.url).map((m, i) => ({ kind: MEDIA_KIND[type], url: String(m.url), name: `${MEDIA_KIND[type]}-${i + 1}` })); break;\n    case 'video': base.media = (a.videos || []).filter((m) => m && m.videoUrl).map((m, i) => ({ kind: 'video', url: String(m.videoUrl), name: `video-${i + 1}` })); break;\n    case 'audioRecording': base.media = a.audioUrl ? [{ kind: 'audio', url: String(a.audioUrl), name: 'audio-1', lengthSec: a.audioLength || null }] : []; break;\n    case 'files': base.media = (a.files || []).filter((m) => m && m.url).map((m) => ({ kind: 'file', url: String(m.url), name: String(m.fileName || 'file').slice(0, 120), size: m.size || null })); break;\n    default: base.value = a.value != null ? String(a.value).slice(0, 500) : null;\n  }\n  if (base.media.length) base.value = `${base.media.length} ${base.media[0].kind}${base.media.length === 1 ? '' : 's'}`;\n  return [base];\n}\n\nconst staticData = $getWorkflowStaticData('global');\nconst ledgerStore = PERSIST ? (staticData.ctChecklistLedger = staticData.ctChecklistLedger || {}) : JSON.parse(JSON.stringify(staticData.ctChecklistLedger || {}));\nconst nowMs = Date.now();\nfor (const [k, v] of Object.entries(ledgerStore)) if (!v || nowMs - v.at > DEDUPE_DAYS * 86400000) delete ledgerStore[k];\nconst seenThisRun = new Set();\n\nconst out = [];\nfor (let index = 0; index < items.length; index++) {\n  const item = items[index];\n  const headers = {};\n  for (const [k, v] of Object.entries(item.json.headers || {})) headers[String(k).toLowerCase()] = Array.isArray(v) ? String(v[0]) : String(v);\n  let raw = null;\n  if (item.binary && item.binary.data) { try { raw = (await helpers.getBinaryDataBuffer(index, 'data')).toString('utf8'); } catch (e) { raw = null; } }\n  let body = item.json.body;\n  if ((!body || (typeof body === 'object' && !Object.keys(body).length)) && raw) { try { body = JSON.parse(raw); } catch (e) { body = null; } }\n  if (raw === null) raw = typeof body === 'string' ? body : JSON.stringify(body ?? {});\n  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = null; } }\n\n  const base = { run, sandboxFixtures: sharedFixtures };\n  const auth = authenticate(headers, raw);\n  if (!auth.ok) { out.push({ json: { ...base, kind: 'rejected', reason: auth.reason, authMethod: auth.method || AUTH_MODE } }); continue; }\n\n  const b = body && typeof body === 'object' ? body : {};\n  const d = b.data || {};\n  const ignore = (reason) => out.push({ json: { ...base, kind: 'ignored', reason, authMethod: auth.method, event: { requestId: b.requestId || null, eventType: b.eventType || null, formId: d.formId ?? null, submissionId: d.formSubmissionId || null } } });\n\n  if (b.activityType !== 'forms') { ignore('not_a_forms_event'); continue; }\n  if (!EVENT_TYPES.has(String(b.eventType))) { ignore('event_type_not_processed'); continue; }\n  const formCfg = FORMS[String(d.formId)];\n  if (!formCfg) { ignore('form_not_configured'); continue; }\n  const submissionId = d.formSubmissionId ? String(d.formSubmissionId) : null;\n  if (!submissionId) { ignore('missing_submission_id'); continue; }\n  const key = `${b.eventType}:${submissionId}`;\n  if (seenThisRun.has(key) || ledgerStore[key]) { ignore('duplicate_submission'); continue; }\n  seenThisRun.add(key);\n\n  const answers = (Array.isArray(d.answers) ? d.answers : []).flatMap((a) => normalizeAnswer(a));\n  const submittedMs = toMs(d.submissionTimestamp) || toMs(b.eventTimestamp) || nowMs;\n  out.push({\n    json: {\n      ...base,\n      kind: 'event',\n      authMethod: auth.method,\n      ledgerKey: key,\n      event: {\n        requestId: b.requestId || null,\n        eventType: b.eventType,\n        formId: String(d.formId),\n        submissionId,\n        entryNum: d.entryNum ?? null,\n        submittedAt: new Date(submittedMs).toISOString(),\n        startedAt: toMs(d.submissionStartTimestamp) ? new Date(toMs(d.submissionStartTimestamp)).toISOString() : null,\n        timezone: d.submissionTimezone || null,\n        submittingUserId: d.submittingUserId != null ? String(d.submittingUserId) : null,\n        isAnonymous: !!d.isAnonymous,\n        managerFieldCount: Array.isArray(d.managerFields) ? d.managerFields.length : 0,\n      },\n      formConfig: { kind: 'job_completion', advance: false, ...formCfg },\n      answers,\n    },\n  });\n}\nreturn out;\n"
+      },
+      "id": "ac8a884a-6cd5-5cde-bf69-c549d8e129be",
+      "name": "Verify Secret & Normalize Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "x-webhook-secret (constant time) or optional HMAC mode · configured forms only · dedupe by formSubmissionId · answers, media and submitter normalised."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "35ba95dc-b848-5773-9869-c20a3edd7b42",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "event",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "bd748dd7-1cac-51b4-aa6b-91a7e1681ee8",
+      "name": "Process Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a2066677-3d83-5fe2-ab8d-4443dcc7578d",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "adeef1de-c559-5e2c-8d59-7be909895846",
+      "name": "Sandbox Lookups?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Load Sandbox Lookups                 Mode: Run Once for Each Item\n// Fictional form definition + submitter, in the same shape the live\n// Connecteam Forms/Users API capture nodes produce.\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nconst fx = item.sandboxFixtures || {};\nconst form = (fx.formDefinitions || {})[item.event.formId] || null;\nconst user = (fx.users || {})[item.event.submittingUserId] || null;\nreturn {\n  json: {\n    ...item,\n    formLookup: form ? { ok: true, source: 'sandbox', formName: form.formName, questions: form.questions } : { ok: false, source: 'sandbox', reason: 'no fixture form definition' },\n    userLookup: user ? { ok: true, source: 'sandbox', firstName: user.firstName, lastName: user.lastName } : { ok: false, source: 'sandbox', reason: 'no fixture user' },\n  },\n};\n"
+      },
+      "id": "647837b4-9c73-57ca-b66a-1ddb6ddd25e1",
+      "name": "Load Sandbox Lookups",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.CONNECTEAM_API_BASE_URL || 'https://api.connecteam.com' }}/forms/v1/forms/{{ encodeURIComponent($json.event.formId) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-KEY",
+              "value": "={{ $env.CONNECTEAM_API_KEY }}"
+            }
+          ]
+        }
+      },
+      "id": "bf1114be-0d32-5d38-bbe5-8b45e965a734",
+      "name": "Fetch Form Definition",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Connecteam Forms API · scope forms.read · form name + question titles (not in the webhook payload)."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Capture Form Definition              Mode: Run Once for Each Item\n// GET /forms/v1/forms/{formId} gives the form name and question titles,\n// which the webhook payload doesn't include. A failed lookup keeps the sync\n// going with question IDs as labels.\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $('Sandbox Lookups?').item.json;\nconst res = $json || {};\nconst ok = Number(res.statusCode) === 200 && res.body;\nconst data = ok ? (res.body.data && (res.body.data.form || (Array.isArray(res.body.data.forms) ? res.body.data.forms[0] : res.body.data))) || res.body : null;\nreturn {\n  json: {\n    ...ctx,\n    formLookup: ok && data\n      ? { ok: true, source: 'connecteam_api', formName: data.formName || data.name || null, questions: Array.isArray(data.questions) ? data.questions : [] }\n      : { ok: false, source: 'connecteam_api', reason: `form lookup returned ${res.statusCode || 'network error'}` },\n  },\n};\n"
+      },
+      "id": "a81a9388-321e-5c0f-b175-ac0504bf0b22",
+      "name": "Capture Form Definition",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.CONNECTEAM_API_BASE_URL || 'https://api.connecteam.com' }}/users/v1/users?userIds={{ encodeURIComponent($json.event.submittingUserId || '0') }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-KEY",
+              "value": "={{ $env.CONNECTEAM_API_KEY }}"
+            }
+          ]
+        }
+      },
+      "id": "b588eb71-a2ea-5daf-bbec-c1e09797858f",
+      "name": "Fetch Submitter",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Connecteam Users API · display name only (first name + last initial)."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Capture Submitter                    Mode: Run Once for Each Item\n// Resolves the submitting user's display name (first name + last initial\n// only). Phone numbers and emails of field staff are never copied.\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $('Capture Form Definition').item.json;\nconst res = $json || {};\nconst ok = Number(res.statusCode) === 200 && res.body;\nconst users = ok && res.body.data ? res.body.data.users || res.body.data.results || [] : [];\nconst u = Array.isArray(users) ? users.find((x) => String(x.userId ?? x.id) === String(ctx.event.submittingUserId)) || null : null;\nreturn {\n  json: {\n    ...ctx,\n    userLookup: u ? { ok: true, source: 'connecteam_api', firstName: u.firstName || null, lastName: u.lastName || null } : { ok: false, source: 'connecteam_api', reason: `user lookup returned ${res.statusCode || 'network error'}` },\n  },\n};\n"
+      },
+      "id": "7da9cfe8-fd45-577c-a82c-0053a9e3f082",
+      "name": "Capture Submitter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Checklist Record               Mode: Run Once for Each Item\n// • Labels answers with question titles\n// • Evaluates the checklist (required items, safety-critical items, photos)\n// • Extracts the deal-matching keys: job number, site address, customer phone\n// • Builds the HTML note and the three HubSpot deal searches\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst PIPELINE = env('HUBSPOT_PIPELINE_ID', 'default');\nconst MATCHABLE = csv('HUBSPOT_MATCHABLE_STAGE_IDS', 'YOUR_SCHEDULED_STAGE_ID,YOUR_IN_PROGRESS_STAGE_ID,YOUR_READY_FOR_INVOICING_STAGE_ID');\nconst JOB_PROP = env('HUBSPOT_JOB_ID_PROPERTY', 'field_job_number');\nconst ADDR_PROP = env('HUBSPOT_ADDRESS_PROPERTY', 'field_site_address');\nconst COUNTRY_CODE = env('DEFAULT_COUNTRY_CALLING_CODE', '1').replace(/\\D/g, '') || '1';\nconst INCLUDE_MEDIA_LINKS = flag('NOTE_INCLUDE_MEDIA_LINKS', true);\nconst INCLUDE_EMPTY = flag('NOTE_INCLUDE_EMPTY_ANSWERS', false);\nconst DISPLAY_TZ = env('DISPLAY_TIMEZONE', '');\nconst STATUS_PROPS = ['field_checklist_status', 'field_last_checklist_type', 'field_last_checklist_at', 'connecteam_last_submission_id'];\n\nconst item = $json;\nconst cfg = item.formConfig;\nconst ev = item.event;\n\n// ── Titles ─────────────────────────────────────────────────────────────\nconst titles = {};\nconst walk = (qs) => {\n  for (const q of qs || []) {\n    if (!q) continue;\n    const id = String(q.questionId ?? q.id ?? '');\n    const t = q.title ?? q.questionTitle ?? q.text ?? q.name ?? q.label;\n    if (id && t) titles[id] = String(t).slice(0, 200);\n    walk(q.questions || q.subQuestions || q.groupQuestions);\n  }\n};\nwalk(item.formLookup && item.formLookup.questions);\nconst answers = item.answers.map((a) => ({ ...a, title: titles[a.questionId] || (cfg.questionTitles && cfg.questionTitles[a.questionId]) || `Question ${a.questionId}` }));\nconst byId = Object.fromEntries(answers.map((a) => [a.questionId, a]));\n\n// ── Evaluation ────────────────────────────────────────────────────────\nconst checkable = answers.filter((a) => (a.questionType === 'yesNo' || a.questionType === 'task') && !a.hidden);\nconst requiredIds = Array.isArray(cfg.requiredPositiveQuestionIds) && cfg.requiredPositiveQuestionIds.length ? cfg.requiredPositiveQuestionIds.map(String) : checkable.map((a) => a.questionId);\nconst safetyIds = (cfg.safetyCriticalQuestionIds || []).map(String);\nconst failed = requiredIds.filter((id) => !safetyIds.includes(id)).map((id) => byId[id] || { questionId: id, title: titles[id] || `Question ${id}`, value: null, positive: null })\n  .filter((a) => a.positive !== true).map((a) => ({ questionId: a.questionId, title: a.title, value: a.value || 'not answered' }));\nconst safetyIssues = safetyIds.map((id) => byId[id]).filter((a) => a && a.positive === false).map((a) => ({ questionId: a.questionId, title: a.title, value: a.value }));\nconst media = answers.flatMap((a) => a.media.map((m) => ({ ...m, question: a.title })));\nconst photoCount = media.filter((m) => m.kind === 'photo' || m.kind === 'scan').length;\nconst signatureCaptured = media.some((m) => m.kind === 'signature');\nconst minPhotos = Math.max(0, Number(cfg.minPhotos ?? 0));\nconst issues = [];\nif (failed.length) issues.push(`${failed.length} required item(s) not confirmed`);\nif (photoCount < minPhotos) issues.push(`${photoCount} of ${minPhotos} required photos`);\nif (cfg.requireSignature && !signatureCaptured) issues.push('customer signature missing');\nif (safetyIssues.length) issues.push(`${safetyIssues.length} safety-critical item(s) answered No`);\nconst status = safetyIssues.length ? 'safety_issue' : issues.length ? 'issues' : 'passed';\n\n// ── Matching keys ─────────────────────────────────────────────────────\nconst val = (id) => (id && byId[String(id)] && byId[String(id)].value) || null;\nconst jobId = val(cfg.jobIdQuestionId) ? String(val(cfg.jobIdQuestionId)).trim().toUpperCase().slice(0, 60) : null;\nconst address = val(cfg.addressQuestionId);\nconst phoneRaw = val(cfg.phoneQuestionId);\nconst toE164 = (v) => {\n  if (!v) return null;\n  const s = String(v).trim(); const d = s.replace(/\\D/g, '');\n  if (s.startsWith('+') && d.length >= 8 && d.length <= 15) return `+${d}`;\n  if (COUNTRY_CODE === '1' && d.length === 10) return `+1${d}`;\n  if (COUNTRY_CODE === '1' && d.length === 11 && d.startsWith('1')) return `+${d}`;\n  return d.length >= 8 && d.length <= 15 ? `+${d}` : null;\n};\nconst phone = toE164(phoneRaw);\nconst ABBR = { street: 'st', drive: 'dr', road: 'rd', avenue: 'ave', court: 'ct', lane: 'ln', boulevard: 'blvd', place: 'pl', terrace: 'ter', highway: 'hwy', parkway: 'pkwy', circle: 'cir', north: 'n', south: 's', east: 'e', west: 'w', apartment: 'apt', suite: 'ste', unit: 'unit' };\nconst normAddr = (s) => String(s || '').toLowerCase().replace(/[.,#]/g, ' ').split(/\\s+/).filter(Boolean).map((t) => ABBR[t] || t).join(' ');\nconst addrNorm = address ? normAddr(address) : null;\nconst addrTokens = addrNorm ? addrNorm.split(' ') : [];\nconst streetNumber = addrTokens.find((t) => /^\\d+[a-z]?$/.test(t)) || null;\nconst isName = (t) => /^[a-z]{3,}$/.test(t) && !Object.values(ABBR).includes(t);\nconst afterNumber = streetNumber ? addrTokens.slice(addrTokens.indexOf(streetNumber) + 1).find(isName) : null;\nconst nameToken = afterNumber || addrTokens.filter((t) => /^[a-z]{3,}$/.test(t) && !Object.values(ABBR).includes(t)).sort((a, b) => b.length - a.length)[0] || null;\n\nconst stageFilters = [{ propertyName: 'pipeline', operator: 'EQ', value: PIPELINE }, { propertyName: 'dealstage', operator: 'IN', values: MATCHABLE }];\nconst props = ['dealname', 'dealstage', 'pipeline', 'hubspot_owner_id', JOB_PROP, ADDR_PROP, ...STATUS_PROPS];\nconst noop = { filterGroups: [{ filters: [{ propertyName: 'hs_object_id', operator: 'EQ', value: '0' }] }], limit: 1 };\nconst searches = {\n  byJobId: jobId ? { filterGroups: [{ filters: [{ propertyName: JOB_PROP, operator: 'EQ', value: jobId }, ...stageFilters] }], properties: props, limit: 5 } : noop,\n  byAddress: nameToken ? { filterGroups: [{ filters: [{ propertyName: ADDR_PROP, operator: 'CONTAINS_TOKEN', value: nameToken }, ...stageFilters] }], properties: props, limit: 20 } : noop,\n  contactByPhone: phone ? { filterGroups: [\n    { filters: [{ propertyName: 'phone', operator: 'EQ', value: phone }] },\n    { filters: [{ propertyName: 'mobilephone', operator: 'EQ', value: phone }] },\n    { filters: [{ propertyName: 'hs_searchable_calculated_phone_number', operator: 'EQ', value: phone.replace(/\\D/g, '').slice(-10) }] }], properties: ['phone'], limit: 3 } : noop,\n  dealsByContactTemplate: { stageFilters, properties: props, limit: 10 },\n  noop,\n};\n\n// ── Note HTML ─────────────────────────────────────────────────────────\nconst html = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\nconst tz = DISPLAY_TZ || ev.timezone || 'UTC';\nconst fmt = (iso) => { try { return new Intl.DateTimeFormat('en-GB', { timeZone: tz, dateStyle: 'medium', timeStyle: 'short' }).format(new Date(iso)); } catch (e) { return iso; } };\nconst KIND_LABEL = { pre_start: 'Pre-start checklist', safety: 'Safety checklist', job_completion: 'Job-completion checklist' };\nconst STATUS_LABEL = { passed: '✅ PASSED', issues: '⚠️ ISSUES FOUND', safety_issue: '🛑 SAFETY ISSUE' };\nconst submitter = item.userLookup && item.userLookup.ok ? `${item.userLookup.firstName || ''} ${item.userLookup.lastName ? item.userLookup.lastName[0] + '.' : ''}`.trim() : ev.isAnonymous ? 'Anonymous' : `User ${ev.submittingUserId || 'unknown'}`;\nconst formName = (item.formLookup && item.formLookup.formName) || cfg.label || `Form ${ev.formId}`;\nconst rows = answers.filter((a) => !a.hidden && (INCLUDE_EMPTY || (a.value !== null && !a.empty)) && a.media.length === 0)\n  .map((a) => `<tr><td>${html(a.path ? a.path.replace(/\\//g, ' › ') : '')}${html(a.title)}</td><td>${a.positive === false ? '<b>' : ''}${html(a.value ?? '—')}${a.positive === false ? '</b>' : ''}${a.hasLocation ? ' 📍' : ''}</td></tr>`);\nconst mediaLines = media.map((m) => {\n  if (m.kind === 'signature') return `<li>✍️ Signature captured (${html(m.question)})</li>`;\n  const label = `${m.kind === 'photo' ? '📷' : m.kind === 'video' ? '🎥' : m.kind === 'audio' ? '🎙️' : m.kind === 'scan' ? '🧾' : '📎'} ${html(m.question)} · ${html(m.name)}`;\n  return INCLUDE_MEDIA_LINKS && /^https:\\/\\//.test(m.url) ? `<li><a href=\"${html(m.url)}\">${label}</a></li>` : `<li>${label}</li>`;\n});\nlet noteBody = `<p><b>${html(KIND_LABEL[cfg.kind] || 'Field checklist')}: ${html(formName)}</b> · ${STATUS_LABEL[status]}</p>`;\nnoteBody += `<p>Submitted by ${html(submitter)} on ${html(fmt(ev.submittedAt))} (${html(tz)})${ev.entryNum != null ? ` · entry #${html(ev.entryNum)}` : ''}${jobId ? ` · job ${html(jobId)}` : ''}${ev.eventType === 'form_submission_edited' ? ' · <i>edited submission</i>' : ''}</p>`;\nif (issues.length) noteBody += `<p><b>Issues:</b> ${html(issues.join('; '))}</p>`;\nif (failed.length) noteBody += `<ul>${failed.map((f) => `<li>${html(f.title)}: <b>${html(f.value)}</b></li>`).join('')}</ul>`;\nnoteBody += `<table><tr><th>Question</th><th>Answer</th></tr>${rows.join('')}</table>`;\nnoteBody += `<p><b>Photo & media log</b> · ${photoCount} photo(s)${signatureCaptured ? ' · signature captured' : ''}${media.length ? '' : ' · none'}</p>${mediaLines.length ? `<ul>${mediaLines.join('')}</ul>` : ''}`;\nif (INCLUDE_MEDIA_LINKS && media.length) noteBody += '<p><i>Media links point to Connecteam storage and may require a Connecteam login or expire.</i></p>';\nnoteBody += `<p><i>Synced from Connecteam submission ${html(ev.submissionId)} · run ${html(item.run.runId)}</i></p>`;\n\nconst { answers: _drop, sandboxFixtures, ...rest } = item;\nreturn {\n  json: {\n    ...rest,\n    sandboxFixtures,\n    formName,\n    submitterLabel: submitter,\n    checklist: {\n      status, issues, failed, safetyIssues, photoCount, minPhotos, signatureCaptured, answerCount: answers.length, mediaCount: media.length,\n      titlesResolved: !!(item.formLookup && item.formLookup.ok),\n    },\n    keys: { jobId, address, addressNorm: addrNorm, streetNumber, nameToken, phone },\n    searches,\n    hubspot: { noteBody, jobProperty: JOB_PROP, addressProperty: ADDR_PROP },\n  },\n};\n"
+      },
+      "id": "23aebd73-9f95-5282-a0de-7b9e0cdc2cd7",
+      "name": "Build Checklist Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        200
+      ],
+      "notes": "Question titles · pass/issues/safety evaluation · job number, address, phone keys · HTML note · deal search bodies."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d439d9c1-f4f4-5a31-a288-7f4a4730ecdc",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "3e31a6fc-2b2c-540d-a0f3-4512bbefc3da",
+      "name": "Sandbox Deal Search?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2160,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Deal Search                 Mode: Run Once for Each Item\n// Sandbox stand-in for the three live HubSpot searches. Applies the same\n// filters (pipeline, matchable stages, job number, address token, contact\n// phone) to fictional deals and answers in the CRM search response shape.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst item = $json;\nconst fx = item.sandboxFixtures || {};\nconst deals = fx.deals || [];\nconst MATCHABLE = new Set(csv('HUBSPOT_MATCHABLE_STAGE_IDS', '') .length ? csv('HUBSPOT_MATCHABLE_STAGE_IDS') : fx.matchableStageIds || []);\nconst PIPELINE = env('HUBSPOT_PIPELINE_ID', '') || fx.pipelineId || 'default';\nconst JOB = item.hubspot.jobProperty;\nconst ADDR = item.hubspot.addressProperty;\nconst open = deals.filter((d) => d.properties.pipeline === PIPELINE && MATCHABLE.has(d.properties.dealstage));\nconst toResult = (list) => ({ statusCode: 200, body: { total: list.length, results: list.map((d) => ({ id: d.id, properties: d.properties })) } });\nconst k = item.keys;\n\nconst byJob = k.jobId ? open.filter((d) => String(d.properties[JOB] || '').toUpperCase() === k.jobId) : [];\nconst byAddr = k.nameToken ? open.filter((d) => String(d.properties[ADDR] || '').toLowerCase().split(/[^a-z0-9]+/).includes(k.nameToken)) : [];\nconst contact = k.phone ? (fx.contacts || []).find((c) => c.phone === k.phone) : null;\nconst byContact = contact ? open.filter((d) => (d.contactIds || []).includes(contact.id)) : [];\n\nreturn {\n  json: {\n    ...item,\n    simulatedSearches: {\n      byJobId: toResult(byJob),\n      byAddress: toResult(byAddr),\n      contactByPhone: { statusCode: 200, body: { total: contact ? 1 : 0, results: contact ? [{ id: contact.id, properties: { phone: contact.phone } }] : [] } },\n      byContact: toResult(byContact),\n    },\n  },\n};\n"
+      },
+      "id": "3d31c4d1-0a3e-5367-8d66-feaa13d9aa51",
+      "name": "Simulate Deal Search",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/deals/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.searches.byJobId) }}"
+      },
+      "id": "3dabbe80-d62d-532c-935e-2af7781b2681",
+      "name": "Search Deals by Job Number",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2400,
+        340
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Scope crm.objects.deals.read · job number property EQ · pipeline + matchable stages."
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/deals/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build Checklist Record').item.json.searches.byAddress) }}"
+      },
+      "id": "c7da54eb-e40a-55d8-bd49-0fd6d1a0680f",
+      "name": "Search Deals by Site Address",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2640,
+        340
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "CONTAINS_TOKEN on the street name; scored in code (street number must match)."
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/contacts/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build Checklist Record').item.json.searches.contactByPhone) }}"
+      },
+      "id": "389dd8d0-a4be-5fe6-b5f5-f589fe9c2ab1",
+      "name": "Search Contact by Phone",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2880,
+        340
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Scope crm.objects.contacts.read"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Contact Deal Search            Mode: Run Once for Each Item\n// Uses the first contact found by phone to search that contact's open deals.\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $('Build Checklist Record').item.json;\nconst res = $json || {};\nconst contact = Number(res.statusCode) === 200 && res.body && Array.isArray(res.body.results) ? res.body.results[0] : null;\nconst t = ctx.searches.dealsByContactTemplate;\nreturn {\n  json: {\n    contactId: contact ? String(contact.id) : null,\n    contactCount: contact ? Number(res.body.total || res.body.results.length) : 0,\n    contactSearchStatus: Number(res.statusCode) || null,\n    body: contact\n      ? { filterGroups: [{ filters: [{ propertyName: 'associations.contact', operator: 'EQ', value: String(contact.id) }, ...t.stageFilters] }], properties: t.properties, limit: t.limit }\n      : ctx.searches.noop,\n  },\n};\n"
+      },
+      "id": "caab143b-4751-52e5-988f-c39d45ee2fc4",
+      "name": "Build Contact Deal Search",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/deals/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}"
+      },
+      "id": "01aab206-c186-52cd-9f29-7613d8313d44",
+      "name": "Search Deals by Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        340
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Resolve Deal Match                   Mode: Run Once for Each Item\n// Scores every candidate deal from the three searches:\n//   job number exact match   100\n//   site address match       50 + 40 × token similarity (street number must match)\n//   contact phone match      60\n//   +10 for each additional source that agrees\n// Matched only when the best score ≥ MIN_MATCH_SCORE and it leads the\n// runner-up by ≥ AMBIGUITY_MARGIN. Ties are never auto-resolved.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst MIN_SCORE = num('MIN_MATCH_SCORE', 60);\nconst MARGIN = num('AMBIGUITY_MARGIN', 15);\nconst ADDR_THRESHOLD = Math.min(1, Math.max(0, num('ADDRESS_MATCH_THRESHOLD', 0.6)));\n\nconst sandbox = !!($json && $json.simulatedSearches);\nlet ctx, res;\nif (sandbox) {\n  ctx = $json;\n  res = ctx.simulatedSearches;\n} else {\n  ctx = $('Build Checklist Record').item.json;\n  const contactStep = $('Build Contact Deal Search').item.json;\n  res = {\n    byJobId: $('Search Deals by Job Number').item.json,\n    byAddress: $('Search Deals by Site Address').item.json,\n    contactByPhone: { statusCode: contactStep.contactSearchStatus, body: { total: contactStep.contactCount, results: contactStep.contactId ? [{ id: contactStep.contactId }] : [] } },\n    byContact: $json,\n  };\n}\nconst k = ctx.keys;\nconst JOB = ctx.hubspot.jobProperty;\nconst ADDR = ctx.hubspot.addressProperty;\nconst searchErrors = [];\nconst results = (name, r, wasUsed) => {\n  if (!wasUsed) return [];\n  if (Number(r && r.statusCode) !== 200 || !r.body || !Array.isArray(r.body.results)) { searchErrors.push(`${name}: ${(r && r.statusCode) || 'network error'}`); return []; }\n  return r.body.results;\n};\n\nconst ABBR = { street: 'st', drive: 'dr', road: 'rd', avenue: 'ave', court: 'ct', lane: 'ln', boulevard: 'blvd', place: 'pl', terrace: 'ter', highway: 'hwy', parkway: 'pkwy', circle: 'cir', north: 'n', south: 's', east: 'e', west: 'w', apartment: 'apt', suite: 'ste' };\nconst normAddr = (s) => String(s || '').toLowerCase().replace(/[.,#]/g, ' ').split(/\\s+/).filter(Boolean).map((t) => ABBR[t] || t);\nconst similarity = (a, b) => { const A = new Set(a), B = new Set(b); const inter = [...A].filter((x) => B.has(x)).length; return A.size + B.size ? inter / (A.size + B.size - inter) : 0; };\n\nconst cands = {};\nconst add = (deal, source, score, detail) => {\n  const c = (cands[deal.id] = cands[deal.id] || { id: String(deal.id), properties: deal.properties || {}, sources: [], best: 0, detail: [] });\n  if (!c.sources.includes(source)) c.sources.push(source);\n  c.best = Math.max(c.best, score);\n  c.detail.push(detail);\n};\nfor (const d of results('job number search', res.byJobId, !!k.jobId)) {\n  if (String((d.properties || {})[JOB] || '').trim().toUpperCase() === k.jobId) add(d, 'job_number', 100, `job ${k.jobId}`);\n}\nfor (const d of results('address search', res.byAddress, !!k.nameToken)) {\n  const tokens = normAddr((d.properties || {})[ADDR]);\n  if (!k.streetNumber || !tokens.includes(k.streetNumber)) continue;\n  const sim = similarity(k.addressNorm.split(' '), tokens);\n  if (sim >= ADDR_THRESHOLD) add(d, 'site_address', Math.round(50 + 40 * sim), `address similarity ${sim.toFixed(2)}`);\n}\nresults('contact search', res.contactByPhone, !!k.phone);\nfor (const d of results('contact deal search', res.byContact, !!k.phone && res.contactByPhone && res.contactByPhone.body && (res.contactByPhone.body.results || []).length > 0)) add(d, 'contact_phone', 60, 'customer phone');\n\nconst ranked = Object.values(cands).map((c) => ({ ...c, score: c.best + 10 * (c.sources.length - 1) })).sort((a, b) => b.score - a.score);\nconst top = ranked[0];\nconst second = ranked[1];\nlet status;\nif (!k.jobId && !k.nameToken && !k.phone) status = 'no_match_keys';\nelse if (!top) status = searchErrors.length ? 'lookup_failed' : 'unmatched';\nelse if (top.score < MIN_SCORE) status = 'unmatched';\nelse if (second && top.score - second.score < MARGIN) status = 'ambiguous';\nelse status = 'matched';\n\nreturn {\n  json: {\n    ...ctx,\n    simulatedSearches: undefined,\n    match: {\n      status,\n      dealId: status === 'matched' ? top.id : null,\n      deal: status === 'matched' ? { id: top.id, name: top.properties.dealname || null, stage: top.properties.dealstage || null, pipeline: top.properties.pipeline || null, ownerId: top.properties.hubspot_owner_id || null } : null,\n      score: top ? top.score : 0,\n      sources: top ? top.sources : [],\n      candidates: ranked.slice(0, 5).map((c) => ({ id: c.id, name: c.properties.dealname || null, score: c.score, sources: c.sources })),\n      searchErrors,\n    },\n  },\n};\n"
+      },
+      "id": "554d3421-f5d6-505a-828b-7049343543f1",
+      "name": "Resolve Deal Match",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        200
+      ],
+      "notes": "job 100 · address 50+40×similarity · contact 60 · +10 per corroborating source · ambiguity margin."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "5ebae5c7-a4a7-5322-b1d7-fc8e399b84e9",
+              "leftValue": "={{ $json.match.status }}",
+              "rightValue": "matched",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "9bb43168-907d-5618-850b-c32ef8bcaeae",
+      "name": "Deal Matched?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3840,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Stage Advancement Router             Mode: Run Once for Each Item\n// Every matched submission gets a note. The deal stage moves to the target\n// (default \"Ready for Invoicing\") only when ALL of these hold:\n//   form is configured with advance=true · new submission (not an edit)\n//   checklist passed · current stage is in ADVANCE_FROM_STAGE_IDS\n//   (forward-only: a deal in a later or closed stage is never moved back)\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst TARGET_DEFAULT = env('HUBSPOT_READY_FOR_INVOICING_STAGE_ID', 'YOUR_READY_FOR_INVOICING_STAGE_ID');\nconst FROM = csv('ADVANCE_FROM_STAGE_IDS', 'YOUR_SCHEDULED_STAGE_ID,YOUR_IN_PROGRESS_STAGE_ID');\nconst WRITE_STATUS = flag('WRITE_CHECKLIST_STATUS_PROPERTIES', true);\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\n\nconst item = $json;\nconst cfg = item.formConfig;\nconst fromStages = SANDBOX_MODE && !env('ADVANCE_FROM_STAGE_IDS', '') && item.sandboxFixtures ? item.sandboxFixtures.advanceFromStageIds || FROM : FROM;\nconst target = String(cfg.targetStageId || (SANDBOX_MODE && item.sandboxFixtures && item.sandboxFixtures.readyForInvoicingStageId) || TARGET_DEFAULT);\nconst m = item.match;\nconst current = m.deal ? m.deal.stage : null;\n\nconst holds = [];\nif (!cfg.advance) holds.push(`${cfg.kind} checklists don't advance the stage`);\nelse {\n  if (item.event.eventType !== 'form_submission') holds.push('edited submissions never advance the stage');\n  if (item.checklist.status !== 'passed') holds.push(`checklist ${item.checklist.status.replace('_', ' ')}: ${item.checklist.issues.join('; ')}`);\n  if (current === target) holds.push('deal is already in the target stage');\n  else if (!fromStages.includes(current)) holds.push(`current stage ${current} is not an allowed starting stage`);\n}\nconst advance = holds.length === 0;\n\nconst properties = {};\nif (advance) properties.dealstage = target;\nif (WRITE_STATUS) {\n  properties.field_checklist_status = item.checklist.status;\n  properties.field_last_checklist_type = cfg.kind;\n  properties.field_last_checklist_at = item.event.submittedAt;\n  properties.connecteam_last_submission_id = item.event.submissionId;\n}\n\nconst banner = advance\n  ? `<p><b>Deal stage advanced</b> to ${String(cfg.targetStageLabel || 'Ready for Invoicing').replace(/[<>&]/g, '')}.</p>`\n  : cfg.advance ? `<p><b>Stage not changed:</b> ${holds.map((h) => h.replace(/[<>&]/g, '')).join('; ')}.</p>` : '';\n\nreturn {\n  json: {\n    ...item,\n    stagePlan: { advance, fromStage: current, toStage: advance ? target : current, targetStage: target, holds },\n    updateDeal: Object.keys(properties).length > 0,\n    requests: {\n      note: {\n        properties: { hs_timestamp: String(Date.parse(item.event.submittedAt) || Date.now()), hs_note_body: item.hubspot.noteBody.replace('</p>', `</p>${banner}`) },\n        associations: [{ to: { id: m.dealId }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 214 }] }],\n      },\n      dealPatch: { properties },\n    },\n  },\n};\n"
+      },
+      "id": "c7cd89c9-6322-56da-b7aa-c9653b999c80",
+      "name": "Stage Advancement Router",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4080,
+        100
+      ],
+      "notes": "Note always · stage → Ready for Invoicing only for a passed, new job-completion submission from an allowed stage (forward-only)."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "7e899551-83bb-53a6-a545-291f3154ba80",
+              "leftValue": "={{ !$json.run.sandboxMode && !$json.run.dryRun }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6fbbc43e-e611-58d9-83f5-e668dc1eaaa0",
+      "name": "Live Writes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4320,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate HubSpot Writes (Dry Run)    Mode: Run Once for Each Item\n// No network call. Shows the note and deal update that would be written.\n// Also used in dry-run mode with live lookups.\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nconst { requests, ...rest } = item;\nreturn {\n  json: {\n    ...rest,\n    sync: {\n      mode: item.run.mode, simulated: true, ok: true,\n      noteId: null, noteBytes: requests.note.properties.hs_note_body.length,\n      dealUpdated: false, wouldUpdate: item.updateDeal ? Object.keys(requests.dealPatch.properties) : [],\n      stageChanged: false, wouldAdvance: item.stagePlan.advance, fromStage: item.stagePlan.fromStage, toStage: item.stagePlan.toStage,\n    },\n    preview: { notePreview: requests.note.properties.hs_note_body.slice(0, 600), dealPatch: requests.dealPatch.properties },\n  },\n};\n"
+      },
+      "id": "ce04885e-6275-5cb9-a998-bf8079684ba4",
+      "name": "Simulate HubSpot Writes (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4560,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/notes",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requests.note) }}"
+      },
+      "id": "170cf440-faa5-5bc6-965e-f1540ed17d1d",
+      "name": "Create Checklist Note",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4560,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Scope crm.objects.contacts.write (notes) · note→deal association 214 · never auto-retried."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Capture Note Result                  Mode: Run Once for Each Item\n// The stage is only advanced when the note was saved, so every stage\n// change has its checklist evidence attached.\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $('Live Writes?').item.json;\nconst res = $json || {};\nconst status = Number(res.statusCode || 0);\nconst noteId = status >= 200 && status < 300 && res.body && res.body.id ? String(res.body.id) : null;\nconst props = { ...ctx.requests.dealPatch.properties };\nif (!noteId) delete props.dealstage; // never advance without the evidence note\nreturn {\n  json: {\n    ...ctx,\n    noteId,\n    noteStatus: status || null,\n    stagePlan: noteId ? ctx.stagePlan : { ...ctx.stagePlan, advance: false, toStage: ctx.stagePlan.fromStage, holds: [...ctx.stagePlan.holds, 'note could not be saved'] },\n    updateDeal: !!noteId && Object.keys(props).length > 0,\n    requests: { ...ctx.requests, dealPatch: { properties: props } },\n  },\n};\n"
+      },
+      "id": "5a664792-e73a-5864-8f6f-db7bd37533b6",
+      "name": "Capture Note Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4800,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "fc856e8f-90f3-5445-9f0a-5b86953494aa",
+              "leftValue": "={{ $json.updateDeal }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "939c4bcd-f50b-5384-9116-3e8762580430",
+      "name": "Update Deal?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5040,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/deals/{{ encodeURIComponent($json.match.dealId) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "PATCH",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requests.dealPatch) }}"
+      },
+      "id": "c697da8d-6f50-5802-84c4-e5a67279b17f",
+      "name": "Update Deal Stage & Properties",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5280,
+        120
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Scope crm.objects.deals.write"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Record Sync Result                   Mode: Run Once for Each Item\n// Collapses the live writes into a `sync` block and records the submission\n// in the idempotency ledger so a Connecteam retry is not applied twice.\n// ─────────────────────────────────────────────────────────────────────\nconst fromPatch = !($json && $json.kind === 'event');\nconst ctx = fromPatch ? $('Capture Note Result').item.json : $json;\nconst res = fromPatch ? $json || {} : null;\nconst patchStatus = res ? Number(res.statusCode || 0) : null;\nconst dealUpdated = !!res && patchStatus >= 200 && patchStatus < 300;\nconst stageChanged = dealUpdated && !!ctx.requests.dealPatch.properties.dealstage;\nconst ok = !!ctx.noteId && (!ctx.updateDeal || dealUpdated);\n\nif (ctx.noteId) {\n  try {\n    const store = $getWorkflowStaticData('global');\n    store.ctChecklistLedger = store.ctChecklistLedger || {};\n    store.ctChecklistLedger[ctx.ledgerKey] = { at: Date.now(), dealId: ctx.match.dealId, noteId: ctx.noteId };\n  } catch (error) { /* best effort */ }\n}\n\nconst { requests, ...rest } = ctx;\nreturn {\n  json: {\n    ...rest,\n    sync: {\n      mode: 'live', simulated: false, ok,\n      noteId: ctx.noteId, noteStatus: ctx.noteStatus,\n      dealUpdated, patchStatus, stageChanged,\n      fromStage: ctx.stagePlan.fromStage, toStage: stageChanged ? ctx.requests.dealPatch.properties.dealstage : ctx.stagePlan.fromStage,\n      hint: ok ? null : !ctx.noteId ? 'note failed: check scopes and the deal ID' : 'deal update failed: check the stage ID and field_* properties',\n    },\n  },\n};\n"
+      },
+      "id": "ed658699-fba3-5b1d-8dd8-5b392733799c",
+      "name": "Record Sync Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5520,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Ops Alert                      Mode: Run Once for Each Item\n// Optional Slack alert for anything a person must handle: no or ambiguous\n// deal match, safety issues, incomplete completion checklists, write\n// failures. Successful syncs are silent unless NOTIFY_ON_SUCCESS=true.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst NOTIFY_ON_SUCCESS = flag('NOTIFY_ON_SUCCESS', false);\nconst PORTAL = env('HUBSPOT_PORTAL_ID', 'YOUR_HUBSPOT_PORTAL_ID');\nconst APP = env('HUBSPOT_APP_BASE_URL', 'https://app.hubspot.com').replace(/\\/+$/, '');\nconst MENTION = env('SLACK_MENTION_ON_SAFETY', '');\n\nconst item = $json;\nconst m = item.match || {};\nconst c = item.checklist || {};\nconst sync = item.sync || null;\nconst esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\nlet why = null;\nif (m.status && m.status !== 'matched') why = `deal_${m.status}`;\nelse if (sync && sync.ok === false) why = 'hubspot_write_failed';\nelse if (c.status === 'safety_issue') why = 'safety_issue';\nelse if (item.formConfig && item.formConfig.advance && c.status === 'issues') why = 'completion_checklist_incomplete';\nelse if (NOTIFY_ON_SUCCESS) why = 'synced';\nconst notify = !!why;\n\nlet slackMessage = null;\nif (notify) {\n  const TITLE = {\n    deal_unmatched: '🔎 Checklist received, but no matching deal was found', deal_ambiguous: '🔀 Checklist matches more than one deal', deal_no_match_keys: '❓ Checklist has no job number, address or phone to match',\n    deal_lookup_failed: '⚠️ Deal lookup failed', hubspot_write_failed: '⚠️ HubSpot update failed', safety_issue: '🛑 Safety issue reported on site',\n    completion_checklist_incomplete: '🟠 Job-completion checklist incomplete: deal not advanced', synced: '✅ Checklist synced to HubSpot',\n  };\n  const dealUrl = m.dealId && !String(m.dealId).startsWith('sandbox') ? `${APP}/contacts/${encodeURIComponent(PORTAL)}/record/0-3/${encodeURIComponent(m.dealId)}` : `${APP}/contacts/${encodeURIComponent(PORTAL)}/objects/0-3/views/all/list`;\n  const blocks = [{ type: 'header', text: { type: 'plain_text', text: (TITLE[why] || why).slice(0, 150), emoji: true } }];\n  if (why === 'safety_issue' && MENTION) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${MENTION} please follow up with the crew` } });\n  blocks.push({\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Checklist*\\n${esc(item.formName)}` },\n      { type: 'mrkdwn', text: `*Submitted by*\\n${esc(item.submitterLabel)}` },\n      { type: 'mrkdwn', text: `*Job number*\\n${esc(item.keys && item.keys.jobId ? item.keys.jobId : 'not given')}` },\n      { type: 'mrkdwn', text: `*Result*\\n${esc(String(c.status || '').replace('_', ' '))} · ${esc(c.photoCount ?? 0)} photo(s)` },\n      { type: 'mrkdwn', text: `*Deal*\\n${m.deal ? esc(m.deal.name || m.dealId) : esc(m.status || 'n/a')}${m.score ? ` (score ${esc(m.score)})` : ''}` },\n      { type: 'mrkdwn', text: `*Stage*\\n${item.stagePlan ? (item.stagePlan.advance ? `→ ${esc(item.stagePlan.toStage)}` : 'unchanged') : 'n/a'}${sync && sync.simulated ? ' _(simulated)_' : ''}` },\n    ],\n  });\n  const lines = [];\n  for (const s of c.safetyIssues || []) lines.push(`🛑 ${esc(s.title)}: *${esc(s.value)}*`);\n  for (const f of (c.failed || []).slice(0, 8)) lines.push(`• ${esc(f.title)}: ${esc(f.value)}`);\n  if (c.photoCount < c.minPhotos) lines.push(`• Photos: ${c.photoCount} of ${c.minPhotos} required`);\n  if (m.status === 'ambiguous') for (const cand of m.candidates.slice(0, 4)) lines.push(`• Candidate: ${esc(cand.name || cand.id)} · score ${cand.score} (${esc(cand.sources.join(', '))})`);\n  if (m.searchErrors && m.searchErrors.length) lines.push(`• Lookup errors: ${esc(m.searchErrors.join('; '))}`);\n  if (sync && sync.hint) lines.push(`• ${esc(sync.hint)}`);\n  if (lines.length) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: lines.join('\\n').slice(0, 2900) } });\n  if (m.status && m.status !== 'matched') blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'Nothing was written to HubSpot. Add the job number to the deal (or fix the checklist) and re-submit, or attach the checklist manually.' }] });\n  blocks.push({ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: m.dealId ? 'Open deal in HubSpot' : 'Open HubSpot deals', emoji: true }, url: dealUrl, ...(why === 'safety_issue' ? { style: 'danger' } : {}) }] });\n  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Submission \\`${esc(item.event.submissionId)}\\` · run \\`${esc(item.run.runId)}\\` · mode ${esc(item.run.mode)} · n8n-connecteam-field-checklist-hubspot-deal-updater` }] });\n  slackMessage = { text: `${TITLE[why] || why}: ${item.formName}`, blocks };\n}\nconst slackDelivery = !notify ? 'none' : SANDBOX_MODE || DRY_RUN ? 'dry_run' : env('SLACK_WEBHOOK_URL', '') ? 'live' : 'not_configured';\nreturn { json: { ...item, sandboxFixtures: undefined, alert: { notify, why }, slackDelivery, slackMessage } };\n"
+      },
+      "id": "f15fe541-7e20-50c6-934c-006bd04f4750",
+      "name": "Build Ops Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5760,
+        300
+      ],
+      "notes": "Slack only for unmatched/ambiguous, safety issues, incomplete completions, write failures."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a56241b6-a90d-58de-bfb0-4ad8a1351684",
+              "leftValue": "={{ $json.slackDelivery }}",
+              "rightValue": "live",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "3ff143d3-3ccd-55ef-a5ae-7041aea4a3e7",
+      "name": "Post Ops Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6000,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "dedbdb4e-d018-5b2a-9e66-fda370f60f41",
+      "name": "Post Ops Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6240,
+        200
+      ],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Confirm Slack Delivery               Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $('Post Ops Alert?').item.json;\nreturn { json: { ...ctx, slackMessage: undefined, slackResult: { simulated: false, mode: 'live', ok: true, at: new Date().toISOString() } } };\n"
+      },
+      "id": "48ed3484-348a-5e1b-9a3a-9fb9d94b97e1",
+      "name": "Confirm Slack Delivery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6480,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitize Slack Error                 Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['CONNECTEAM_WEBHOOK_SECRET', 'CONNECTEAM_API_KEY', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\n\nconst ctx = $('Post Ops Alert?').item.json;\nconst err = $json.error ?? $json;\nconst message = typeof err === 'string' ? err : (err && (err.message || err.description)) || 'slack_post_failed';\nconst httpCode = (err && (err.httpCode || err.statusCode || err.status)) || null;\nreturn { json: { ...ctx, slackMessage: undefined, slackResult: { simulated: false, mode: 'live', ok: false, httpCode: httpCode ? String(httpCode) : null, message: redactString(message).slice(0, 300) } } };\n"
+      },
+      "id": "459568f6-1b2c-5487-9d28-ed2579684a08",
+      "name": "Sanitize Slack Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6480,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Alert (Dry Run)             Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nreturn {\n  json: {\n    ...item,\n    slackResult: {\n      simulated: true, mode: item.slackDelivery || 'none', blockCount: item.slackMessage ? item.slackMessage.blocks.length : 0,\n      note: item.slackDelivery === 'not_configured' ? 'SLACK_WEBHOOK_URL not set: alert not posted' : item.slackDelivery === 'dry_run' ? 'dry run: Block Kit built, not posted' : 'no alert needed',\n    },\n  },\n};\n"
+      },
+      "id": "13b6918d-3057-5b61-a4db-6d515d61c547",
+      "name": "Simulate Alert (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6240,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Audit Logger                         Mode: Run Once for Each Item\n// One redacted record per webhook delivery. IDs, statuses and counts only:\n// no answers, addresses, media URLs or customer contact details.\n// Written to stdout and a static-data ring buffer (not in sandbox).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['CONNECTEAM_WEBHOOK_SECRET', 'CONNECTEAM_API_KEY', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst RING_SIZE = Math.max(0, num('AUDIT_RING_BUFFER_SIZE', 300));\nconst LOG_TO_STDOUT = flag('AUDIT_LOG_TO_STDOUT', true);\n\nconst item = $json;\nconst c = item.checklist || null;\nconst m = item.match || null;\nconst record = redact({\n  auditVersion: 1,\n  at: new Date().toISOString(),\n  workflowId: $workflow.id || null,\n  executionId: $execution.id || null,\n  runId: item.run ? item.run.runId : null,\n  mode: item.run ? item.run.mode : null,\n  kind: item.kind || null,\n  reason: item.reason || null,\n  authenticatedWith: item.authMethod || null,\n  event: item.event ? { requestId: item.event.requestId, eventType: item.event.eventType, formId: item.event.formId, submissionId: item.event.submissionId, submittedAt: item.event.submittedAt || null, submittingUserId: item.event.submittingUserId || null } : null,\n  checklistKind: item.formConfig ? item.formConfig.kind : null,\n  checklist: c ? { status: c.status, issueCount: c.issues.length, failedCount: c.failed.length, safetyIssueCount: c.safetyIssues.length, photoCount: c.photoCount, signedOff: c.signatureCaptured, answerCount: c.answerCount, titlesResolved: c.titlesResolved } : null,\n  matchKeys: item.keys ? { jobId: item.keys.jobId, hasAddress: !!item.keys.address, phone: maskPhone(item.keys.phone) } : null,\n  match: m ? { status: m.status, dealId: m.dealId, score: m.score, sources: m.sources, candidateCount: m.candidates.length, searchErrors: m.searchErrors } : null,\n  stage: item.stagePlan ? { advance: item.stagePlan.advance, from: item.stagePlan.fromStage, to: item.stagePlan.toStage, holdCount: item.stagePlan.holds.length } : null,\n  sync: item.sync ? { mode: item.sync.mode, simulated: item.sync.simulated, ok: item.sync.ok, noteId: item.sync.noteId, dealUpdated: item.sync.dealUpdated, stageChanged: item.sync.stageChanged, wouldAdvance: item.sync.wouldAdvance ?? null } : null,\n  alert: item.alert || null,\n  slack: item.slackResult || null,\n});\n\nif (LOG_TO_STDOUT) {\n  try { console.log(`[ct-checklist-sync] ${JSON.stringify(record)}`); } catch (error) { /* best effort */ }\n}\nif (RING_SIZE > 0 && !SANDBOX_MODE) {\n  try {\n    const store = $getWorkflowStaticData('global');\n    if (!Array.isArray(store.ctChecklistAudit)) store.ctChecklistAudit = [];\n    store.ctChecklistAudit.push(record);\n    if (store.ctChecklistAudit.length > RING_SIZE) store.ctChecklistAudit.splice(0, store.ctChecklistAudit.length - RING_SIZE);\n  } catch (error) { /* static data unavailable in some manual runs */ }\n}\nreturn { json: record };\n"
+      },
+      "id": "d58caa63-5471-57b7-b86f-829a6bdcd2e7",
+      "name": "Audit Logger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6720,
+        300
+      ],
+      "notes": "IDs, statuses and counts only · stdout + static-data ring buffer."
+    },
+    {
+      "parameters": {},
+      "id": "ec4f5367-9e58-5d70-9c89-0ce8b090feee",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        900
+      ],
+      "notes": "Fires when this workflow is selected as its own Error Workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitized Error Handler              Mode: Run Once for All Items\n// Fed by the Error Trigger when this workflow is its own Error Workflow.\n// Drops stack traces and request options, redacts secrets, and emits a\n// safe alert record (and optionally a minimal Slack notice).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['CONNECTEAM_WEBHOOK_SECRET', 'CONNECTEAM_API_KEY', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\n\nreturn $input.all().map(({ json }) => {\n  const execution = json.execution || {};\n  const error = execution.error || (json.trigger && json.trigger.error) || {};\n  const alert = {\n    alertType: 'ct_checklist_sync_execution_error',\n    at: new Date().toISOString(),\n    workflow: { id: json.workflow ? json.workflow.id : null, name: redactString(json.workflow ? json.workflow.name : '') },\n    execution: { id: execution.id || null, mode: execution.mode || null, retryOf: execution.retryOf || null },\n    lastNodeExecuted: execution.lastNodeExecuted || null,\n    errorName: redactString(error.name || 'Error'),\n    errorMessage: redactString(error.message || 'unknown error').slice(0, 300),\n    nextStep: 'Open the execution in n8n (restricted access) and check the node named in lastNodeExecuted.',\n  };\n  try { console.error(`[ct-checklist-sync:error] ${JSON.stringify(alert)}`); } catch (e) { /* best effort */ }\n  const notify = !SANDBOX_MODE && !DRY_RUN && env('SLACK_WEBHOOK_URL', '') !== '' && flag('SLACK_NOTIFY_ON_MONITOR_ERROR', true);\n  return {\n    json: {\n      ...alert,\n      notify,\n      slackMessage: {\n        text: `Connecteam checklist sync failed at ${alert.lastNodeExecuted || 'unknown node'}`,\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: '⚠️ Connecteam checklist sync failed', emoji: true } },\n          { type: 'section', text: { type: 'mrkdwn', text: `*Node:* ${alert.lastNodeExecuted || 'unknown'}\\n*Error:* ${alert.errorName}: ${alert.errorMessage}` } },\n          { type: 'context', elements: [{ type: 'mrkdwn', text: `Execution \\`${alert.execution.id || 'n/a'}\\` · re-send or manually attach checklists submitted while this was failing` }] },\n        ],\n      },\n    },\n  };\n});\n"
+      },
+      "id": "03d3f5d4-61d3-5936-b530-a48c6300f78c",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "2626ae97-7d9b-5dca-8df6-be446ca6df88",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "9bcf7f28-a92a-523f-a30e-450ed49db167",
+      "name": "Notify Execution Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "d98fd27f-fb0f-5b93-8ff4-23e17daa8f15",
+      "name": "Post Execution Error Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        840
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## n8n-connecteam-field-checklist-hubspot-deal-updater\nConnecteam field checklists → HubSpot deal note → Ready for Invoicing. dhRobin Systems.\n\n**Safe defaults:** `SANDBOX_MODE=true`, `DRY_RUN=true`. No Connecteam, HubSpot or Slack calls until both are `false`.\n\n**Stage 1** Execute *Connecteam Webhook Trigger* (10 fictional deliveries).\n**Stage 2** `SANDBOX_MODE=false`: real lookups, writes simulated.\n**Stage 3** `DRY_RUN=false`: notes, stage changes and Slack alerts go live.\n\nConnecteam sends a shared secret header, not an HMAC. See README.md.",
+        "height": 320,
+        "width": 700,
+        "color": 4
+      },
+      "id": "deabcfd5-076c-56d8-a6b1-3ec48e669e21",
+      "name": "Sticky: Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Deal matching\nJob number → site address → customer phone. Ambiguous or unmatched submissions write nothing and raise an alert.",
+        "height": 110,
+        "width": 560,
+        "color": 3
+      },
+      "id": "2fc499c6-4e70-5561-8f11-b8ef762a532e",
+      "name": "Sticky: Matching",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2360,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Sanitized error path\nNo stack traces, headers, answers or request bodies. Keys, tokens and webhook secrets are redacted.",
+        "height": 90,
+        "width": 600,
+        "color": 2
+      },
+      "id": "9dc37c37-dcb4-52c9-9156-d230e2675482",
+      "name": "Sticky: Errors",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        780
+      ]
+    }
+  ],
+  "connections": {
+    "Connecteam Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Verify Secret & Normalize Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Secret & Normalize Event": {
+      "main": [
+        [
+          {
+            "node": "Process Event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Event?": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Lookups?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Lookups?": {
+      "main": [
+        [
+          {
+            "node": "Load Sandbox Lookups",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch Form Definition",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Sandbox Lookups": {
+      "main": [
+        [
+          {
+            "node": "Build Checklist Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Form Definition": {
+      "main": [
+        [
+          {
+            "node": "Capture Form Definition",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capture Form Definition": {
+      "main": [
+        [
+          {
+            "node": "Fetch Submitter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Submitter": {
+      "main": [
+        [
+          {
+            "node": "Capture Submitter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capture Submitter": {
+      "main": [
+        [
+          {
+            "node": "Build Checklist Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Checklist Record": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Deal Search?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Deal Search?": {
+      "main": [
+        [
+          {
+            "node": "Simulate Deal Search",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Deals by Job Number",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Deal Search": {
+      "main": [
+        [
+          {
+            "node": "Resolve Deal Match",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Deals by Job Number": {
+      "main": [
+        [
+          {
+            "node": "Search Deals by Site Address",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Deals by Site Address": {
+      "main": [
+        [
+          {
+            "node": "Search Contact by Phone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Contact by Phone": {
+      "main": [
+        [
+          {
+            "node": "Build Contact Deal Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Contact Deal Search": {
+      "main": [
+        [
+          {
+            "node": "Search Deals by Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Deals by Contact": {
+      "main": [
+        [
+          {
+            "node": "Resolve Deal Match",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Deal Match": {
+      "main": [
+        [
+          {
+            "node": "Deal Matched?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deal Matched?": {
+      "main": [
+        [
+          {
+            "node": "Stage Advancement Router",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Ops Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage Advancement Router": {
+      "main": [
+        [
+          {
+            "node": "Live Writes?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live Writes?": {
+      "main": [
+        [
+          {
+            "node": "Create Checklist Note",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate HubSpot Writes (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate HubSpot Writes (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Build Ops Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Checklist Note": {
+      "main": [
+        [
+          {
+            "node": "Capture Note Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capture Note Result": {
+      "main": [
+        [
+          {
+            "node": "Update Deal?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Deal?": {
+      "main": [
+        [
+          {
+            "node": "Update Deal Stage & Properties",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Sync Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Deal Stage & Properties": {
+      "main": [
+        [
+          {
+            "node": "Record Sync Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Sync Result": {
+      "main": [
+        [
+          {
+            "node": "Build Ops Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Ops Alert": {
+      "main": [
+        [
+          {
+            "node": "Post Ops Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Ops Alert?": {
+      "main": [
+        [
+          {
+            "node": "Post Ops Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Alert (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Ops Alert": {
+      "main": [
+        [
+          {
+            "node": "Confirm Slack Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanitize Slack Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm Slack Delivery": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Slack Error": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Alert (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitized Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Notify Execution Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Execution Error?": {
+      "main": [
+        [
+          {
+            "node": "Post Execution Error Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "Connecteam Webhook Trigger": [
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-webhook-secret": "sandbox-fictional-connecteam-secret-not-for-production",
+            "user-agent": "Connecteam-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "requestId": "req-fixture-sub-ct-0001",
+            "company": "Fictional Field Services Co",
+            "activityType": "forms",
+            "eventType": "form_submission",
+            "eventTimestamp": 1794900005,
+            "data": {
+              "formSubmissionId": "sub-ct-0001",
+              "formId": 7001,
+              "submissionTimestamp": 1794900000,
+              "submissionStartTimestamp": 1794899100,
+              "submissionTimezone": "America/Chicago",
+              "entryNum": 1,
+              "submittingUserId": 501,
+              "isAnonymous": false,
+              "answers": [
+                {
+                  "questionId": 101,
+                  "questionType": "openEnded",
+                  "value": "JOB-10422"
+                },
+                {
+                  "questionId": 102,
+                  "questionType": "task",
+                  "isChecked": true
+                },
+                {
+                  "questionId": 103,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 104,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 105,
+                  "questionType": "image",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0001/image-1.jpg"
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/connecteam-checklist-submitted",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT pre-start for JOB-10422 · matched by job number · note only (pre-start never advances)",
+          "sandboxFixtures": {
+            "formConfig": {
+              "7001": {
+                "kind": "pre_start",
+                "label": "Pre-Start Vehicle & Site Check",
+                "advance": false,
+                "jobIdQuestionId": "101",
+                "minPhotos": 1
+              },
+              "7002": {
+                "kind": "safety",
+                "label": "Site Safety Checklist",
+                "advance": false,
+                "jobIdQuestionId": "201",
+                "addressQuestionId": "202",
+                "safetyCriticalQuestionIds": [
+                  "203"
+                ],
+                "minPhotos": 1
+              },
+              "7003": {
+                "kind": "job_completion",
+                "label": "Job Completion Sign-off",
+                "advance": true,
+                "jobIdQuestionId": "301",
+                "addressQuestionId": "302",
+                "phoneQuestionId": "303",
+                "minPhotos": 2,
+                "requireSignature": true
+              }
+            },
+            "formDefinitions": {
+              "7001": {
+                "formName": "Pre-Start Vehicle & Site Check",
+                "questions": [
+                  {
+                    "questionId": 101,
+                    "title": "Job number",
+                    "questionType": "openEnded"
+                  },
+                  {
+                    "questionId": 102,
+                    "title": "Vehicle walk-around complete",
+                    "questionType": "task"
+                  },
+                  {
+                    "questionId": 103,
+                    "title": "PPE available and in good condition?",
+                    "questionType": "yesNo"
+                  },
+                  {
+                    "questionId": 104,
+                    "title": "Site access confirmed with customer?",
+                    "questionType": "yesNo"
+                  },
+                  {
+                    "questionId": 105,
+                    "title": "Vehicle photo",
+                    "questionType": "image"
+                  }
+                ]
+              },
+              "7002": {
+                "formName": "Site Safety Checklist",
+                "questions": [
+                  {
+                    "questionId": 201,
+                    "title": "Job number (if known)",
+                    "questionType": "openEnded"
+                  },
+                  {
+                    "questionId": 202,
+                    "title": "Site address",
+                    "questionType": "location"
+                  },
+                  {
+                    "questionId": 203,
+                    "title": "Exposed wiring or electrical hazards controlled?",
+                    "questionType": "yesNo"
+                  },
+                  {
+                    "questionId": 204,
+                    "title": "Work area barricaded?",
+                    "questionType": "yesNo"
+                  },
+                  {
+                    "questionId": 205,
+                    "title": "Hazard photos",
+                    "questionType": "image"
+                  },
+                  {
+                    "questionId": 206,
+                    "title": "Safety notes",
+                    "questionType": "openEnded"
+                  }
+                ]
+              },
+              "7003": {
+                "formName": "Job Completion Sign-off",
+                "questions": [
+                  {
+                    "questionId": 301,
+                    "title": "Job number",
+                    "questionType": "openEnded"
+                  },
+                  {
+                    "questionId": 302,
+                    "title": "Site address",
+                    "questionType": "openEnded"
+                  },
+                  {
+                    "questionId": 303,
+                    "title": "Customer phone",
+                    "questionType": "phoneNumber"
+                  },
+                  {
+                    "questionId": 304,
+                    "title": "All work completed?",
+                    "questionType": "yesNo"
+                  },
+                  {
+                    "questionId": 305,
+                    "title": "Site cleaned and debris removed?",
+                    "questionType": "yesNo"
+                  },
+                  {
+                    "questionId": 306,
+                    "title": "Materials used",
+                    "questionType": "multipleChoice"
+                  },
+                  {
+                    "questionId": 307,
+                    "title": "Labor hours",
+                    "questionType": "number"
+                  },
+                  {
+                    "questionId": 308,
+                    "title": "Final checks",
+                    "questionType": "group",
+                    "questions": [
+                      {
+                        "questionId": 309,
+                        "title": "Test run passed",
+                        "questionType": "task"
+                      }
+                    ]
+                  },
+                  {
+                    "questionId": 310,
+                    "title": "Completion photos",
+                    "questionType": "image"
+                  },
+                  {
+                    "questionId": 311,
+                    "title": "Customer signature",
+                    "questionType": "signature"
+                  },
+                  {
+                    "questionId": 312,
+                    "title": "Technician notes",
+                    "questionType": "openEnded"
+                  }
+                ]
+              }
+            },
+            "users": {
+              "501": {
+                "firstName": "Jordan",
+                "lastName": "Fieldtech"
+              },
+              "502": {
+                "firstName": "Sam",
+                "lastName": "Rivera"
+              }
+            },
+            "deals": [
+              {
+                "id": "sandbox-deal-1001",
+                "contactIds": [
+                  "sandbox-contact-1"
+                ],
+                "properties": {
+                  "dealname": "Fixture Henderson · kitchen rewire",
+                  "dealstage": "in_progress",
+                  "pipeline": "default",
+                  "hubspot_owner_id": "YOUR_OWNER_ID_A",
+                  "field_job_number": "JOB-10422",
+                  "field_site_address": "418 Willow Creek Dr, Fixture Valley"
+                }
+              },
+              {
+                "id": "sandbox-deal-1002",
+                "contactIds": [
+                  "sandbox-contact-3"
+                ],
+                "properties": {
+                  "dealname": "Fixture Alvarez · panel upgrade",
+                  "dealstage": "in_progress",
+                  "pipeline": "default",
+                  "hubspot_owner_id": "YOUR_OWNER_ID_A",
+                  "field_job_number": "JOB-10431",
+                  "field_site_address": "77 Juniper Court, Fixture Valley"
+                }
+              },
+              {
+                "id": "sandbox-deal-1003",
+                "contactIds": [
+                  "sandbox-contact-4"
+                ],
+                "properties": {
+                  "dealname": "Fixture Patel · bathroom fan install",
+                  "dealstage": "scheduled",
+                  "pipeline": "default",
+                  "hubspot_owner_id": "YOUR_OWNER_ID_A",
+                  "field_job_number": "JOB-10437",
+                  "field_site_address": "12 Birch Row, Fixture Valley"
+                }
+              },
+              {
+                "id": "sandbox-deal-1004",
+                "contactIds": [
+                  "sandbox-contact-5"
+                ],
+                "properties": {
+                  "dealname": "Fixture Nguyen · EV charger",
+                  "dealstage": "ready_for_invoicing",
+                  "pipeline": "default",
+                  "hubspot_owner_id": "YOUR_OWNER_ID_A",
+                  "field_job_number": "JOB-10440",
+                  "field_site_address": "5 Aspen Way, Fixture Valley"
+                }
+              },
+              {
+                "id": "sandbox-deal-1005",
+                "contactIds": [
+                  "sandbox-contact-2"
+                ],
+                "properties": {
+                  "dealname": "Fixture Okafor · garage outlet",
+                  "dealstage": "in_progress",
+                  "pipeline": "default",
+                  "hubspot_owner_id": "YOUR_OWNER_ID_A",
+                  "field_job_number": "JOB-10445",
+                  "field_site_address": "31 Larch Street, Fixture Valley"
+                }
+              },
+              {
+                "id": "sandbox-deal-1006",
+                "contactIds": [
+                  "sandbox-contact-2"
+                ],
+                "properties": {
+                  "dealname": "Fixture Okafor · porch lighting",
+                  "dealstage": "scheduled",
+                  "pipeline": "default",
+                  "hubspot_owner_id": "YOUR_OWNER_ID_A",
+                  "field_job_number": "JOB-10446",
+                  "field_site_address": "31 Larch Street, Fixture Valley"
+                }
+              },
+              {
+                "id": "sandbox-deal-1007",
+                "contactIds": [
+                  "sandbox-contact-1"
+                ],
+                "properties": {
+                  "dealname": "Fixture Henderson · 2025 service call",
+                  "dealstage": "closedwon",
+                  "pipeline": "default",
+                  "hubspot_owner_id": "YOUR_OWNER_ID_A",
+                  "field_job_number": "JOB-09100",
+                  "field_site_address": "418 Willow Creek Dr, Fixture Valley"
+                }
+              }
+            ],
+            "contacts": [
+              {
+                "id": "sandbox-contact-1",
+                "phone": "+15550100142"
+              },
+              {
+                "id": "sandbox-contact-2",
+                "phone": "+15550100166"
+              }
+            ],
+            "pipelineId": "default",
+            "matchableStageIds": [
+              "scheduled",
+              "in_progress",
+              "ready_for_invoicing"
+            ],
+            "advanceFromStageIds": [
+              "scheduled",
+              "in_progress"
+            ],
+            "readyForInvoicingStageId": "ready_for_invoicing"
+          }
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-webhook-secret": "sandbox-fictional-connecteam-secret-not-for-production",
+            "user-agent": "Connecteam-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "requestId": "req-fixture-sub-ct-0002",
+            "company": "Fictional Field Services Co",
+            "activityType": "forms",
+            "eventType": "form_submission",
+            "eventTimestamp": 1794901205,
+            "data": {
+              "formSubmissionId": "sub-ct-0002",
+              "formId": 7002,
+              "submissionTimestamp": 1794901200,
+              "submissionStartTimestamp": 1794900300,
+              "submissionTimezone": "America/Chicago",
+              "entryNum": 2,
+              "submittingUserId": 502,
+              "isAnonymous": false,
+              "answers": [
+                {
+                  "questionId": 201,
+                  "questionType": "openEnded",
+                  "value": "",
+                  "wasSubmittedEmpty": true
+                },
+                {
+                  "questionId": 202,
+                  "questionType": "location",
+                  "locationInput": {
+                    "address": "77 Juniper Ct, Fixture Valley",
+                    "lat": 0.0,
+                    "lng": 0.0
+                  },
+                  "location": {
+                    "lat": 0.0,
+                    "lng": 0.0
+                  }
+                },
+                {
+                  "questionId": 203,
+                  "questionType": "yesNo",
+                  "selectedIndex": 1
+                },
+                {
+                  "questionId": 204,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 205,
+                  "questionType": "image",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0002/image-1.jpg"
+                    },
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0002/image-2.jpg"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 206,
+                  "questionType": "openEnded",
+                  "value": "Exposed conductors behind the old panel; area taped off, customer told to keep clear."
+                }
+              ]
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/connecteam-checklist-submitted",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT safety issue · no job number · matched by site address to JOB-10431 · note, no stage change · Slack alert"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-webhook-secret": "sandbox-fictional-connecteam-secret-not-for-production",
+            "user-agent": "Connecteam-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "requestId": "req-fixture-sub-ct-0003",
+            "company": "Fictional Field Services Co",
+            "activityType": "forms",
+            "eventType": "form_submission",
+            "eventTimestamp": 1794907205,
+            "data": {
+              "formSubmissionId": "sub-ct-0003",
+              "formId": 7003,
+              "submissionTimestamp": 1794907200,
+              "submissionStartTimestamp": 1794906300,
+              "submissionTimezone": "America/Chicago",
+              "entryNum": 3,
+              "submittingUserId": 501,
+              "isAnonymous": false,
+              "answers": [
+                {
+                  "questionId": 301,
+                  "questionType": "openEnded",
+                  "value": "job-10422"
+                },
+                {
+                  "questionId": 302,
+                  "questionType": "openEnded",
+                  "value": "418 Willow Creek Drive"
+                },
+                {
+                  "questionId": 303,
+                  "questionType": "phoneNumber",
+                  "value": "(555) 010-0142"
+                },
+                {
+                  "questionId": 304,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 305,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 306,
+                  "questionType": "multipleChoice",
+                  "selectedAnswers": [
+                    {
+                      "text": "20A breaker"
+                    },
+                    {
+                      "text": "12/2 Romex"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 307,
+                  "questionType": "number",
+                  "inputValue": 6.5
+                },
+                {
+                  "questionId": 308,
+                  "questionType": "group",
+                  "answers": [
+                    {
+                      "questionId": 309,
+                      "questionType": "task",
+                      "isChecked": true
+                    }
+                  ]
+                },
+                {
+                  "questionId": 310,
+                  "questionType": "image",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/image-1.jpg"
+                    },
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/image-2.jpg"
+                    },
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/image-3.jpg"
+                    },
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/image-4.jpg"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 311,
+                  "questionType": "signature",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/signature-1.jpg"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 312,
+                  "questionType": "openEnded",
+                  "value": "Replaced kitchen circuits; customer walked through the panel labels."
+                }
+              ]
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/connecteam-checklist-submitted",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT job completion passed · matched by job number + address + phone · note + stage in_progress → ready_for_invoicing"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-webhook-secret": "sandbox-fictional-connecteam-secret-not-for-production",
+            "user-agent": "Connecteam-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "requestId": "req-fixture-sub-ct-0004",
+            "company": "Fictional Field Services Co",
+            "activityType": "forms",
+            "eventType": "form_submission",
+            "eventTimestamp": 1794908005,
+            "data": {
+              "formSubmissionId": "sub-ct-0004",
+              "formId": 7003,
+              "submissionTimestamp": 1794908000,
+              "submissionStartTimestamp": 1794907100,
+              "submissionTimezone": "America/Chicago",
+              "entryNum": 4,
+              "submittingUserId": 502,
+              "isAnonymous": false,
+              "answers": [
+                {
+                  "questionId": 301,
+                  "questionType": "openEnded",
+                  "value": "JOB-10437"
+                },
+                {
+                  "questionId": 304,
+                  "questionType": "yesNo",
+                  "selectedIndex": 1
+                },
+                {
+                  "questionId": 305,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 308,
+                  "questionType": "group",
+                  "answers": [
+                    {
+                      "questionId": 309,
+                      "questionType": "task",
+                      "isChecked": false
+                    }
+                  ]
+                },
+                {
+                  "questionId": 310,
+                  "questionType": "image",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0004/image-1.jpg"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 311,
+                  "questionType": "signature",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0004/signature-1.jpg"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 312,
+                  "questionType": "openEnded",
+                  "value": "Fan housing back-ordered; return visit needed."
+                }
+              ]
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/connecteam-checklist-submitted",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT completion incomplete (work not finished, 1 of 2 photos) · note, stage held · Slack alert"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-webhook-secret": "sandbox-fictional-connecteam-secret-not-for-production",
+            "user-agent": "Connecteam-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "requestId": "req-fixture-sub-ct-0005",
+            "company": "Fictional Field Services Co",
+            "activityType": "forms",
+            "eventType": "form_submission",
+            "eventTimestamp": 1794909005,
+            "data": {
+              "formSubmissionId": "sub-ct-0005",
+              "formId": 7003,
+              "submissionTimestamp": 1794909000,
+              "submissionStartTimestamp": 1794908100,
+              "submissionTimezone": "America/Chicago",
+              "entryNum": 5,
+              "submittingUserId": 501,
+              "isAnonymous": false,
+              "answers": [
+                {
+                  "questionId": 301,
+                  "questionType": "openEnded",
+                  "value": "JOB-10440"
+                },
+                {
+                  "questionId": 304,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 305,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 308,
+                  "questionType": "group",
+                  "answers": [
+                    {
+                      "questionId": 309,
+                      "questionType": "task",
+                      "isChecked": true
+                    }
+                  ]
+                },
+                {
+                  "questionId": 310,
+                  "questionType": "image",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0005/image-1.jpg"
+                    },
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0005/image-2.jpg"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 311,
+                  "questionType": "signature",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0005/signature-1.jpg"
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/connecteam-checklist-submitted",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT completion passed but deal already in Ready for Invoicing · note only, no alert"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-webhook-secret": "sandbox-fictional-connecteam-secret-not-for-production",
+            "user-agent": "Connecteam-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "requestId": "req-fixture-sub-ct-0006",
+            "company": "Fictional Field Services Co",
+            "activityType": "forms",
+            "eventType": "form_submission",
+            "eventTimestamp": 1794909605,
+            "data": {
+              "formSubmissionId": "sub-ct-0006",
+              "formId": 7003,
+              "submissionTimestamp": 1794909600,
+              "submissionStartTimestamp": 1794908700,
+              "submissionTimezone": "America/Chicago",
+              "entryNum": 6,
+              "submittingUserId": 502,
+              "isAnonymous": false,
+              "answers": [
+                {
+                  "questionId": 303,
+                  "questionType": "phoneNumber",
+                  "value": "555-010-0166"
+                },
+                {
+                  "questionId": 304,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 305,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 308,
+                  "questionType": "group",
+                  "answers": [
+                    {
+                      "questionId": 309,
+                      "questionType": "task",
+                      "isChecked": true
+                    }
+                  ]
+                },
+                {
+                  "questionId": 310,
+                  "questionType": "image",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0006/image-1.jpg"
+                    },
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0006/image-2.jpg"
+                    },
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0006/image-3.jpg"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 311,
+                  "questionType": "signature",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0006/signature-1.jpg"
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/connecteam-checklist-submitted",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ambiguous · no job number · phone matches a contact with two open deals · nothing written · Slack alert"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-webhook-secret": "sandbox-fictional-connecteam-secret-not-for-production",
+            "user-agent": "Connecteam-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "requestId": "req-fixture-retry-0003",
+            "company": "Fictional Field Services Co",
+            "activityType": "forms",
+            "eventType": "form_submission",
+            "eventTimestamp": 1794907205,
+            "data": {
+              "formSubmissionId": "sub-ct-0003",
+              "formId": 7003,
+              "submissionTimestamp": 1794907200,
+              "submissionStartTimestamp": 1794906300,
+              "submissionTimezone": "America/Chicago",
+              "entryNum": 3,
+              "submittingUserId": 501,
+              "isAnonymous": false,
+              "answers": [
+                {
+                  "questionId": 301,
+                  "questionType": "openEnded",
+                  "value": "job-10422"
+                },
+                {
+                  "questionId": 302,
+                  "questionType": "openEnded",
+                  "value": "418 Willow Creek Drive"
+                },
+                {
+                  "questionId": 303,
+                  "questionType": "phoneNumber",
+                  "value": "(555) 010-0142"
+                },
+                {
+                  "questionId": 304,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 305,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 306,
+                  "questionType": "multipleChoice",
+                  "selectedAnswers": [
+                    {
+                      "text": "20A breaker"
+                    },
+                    {
+                      "text": "12/2 Romex"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 307,
+                  "questionType": "number",
+                  "inputValue": 6.5
+                },
+                {
+                  "questionId": 308,
+                  "questionType": "group",
+                  "answers": [
+                    {
+                      "questionId": 309,
+                      "questionType": "task",
+                      "isChecked": true
+                    }
+                  ]
+                },
+                {
+                  "questionId": 310,
+                  "questionType": "image",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/image-1.jpg"
+                    },
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/image-2.jpg"
+                    },
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/image-3.jpg"
+                    },
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/image-4.jpg"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 311,
+                  "questionType": "signature",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/signature-1.jpg"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 312,
+                  "questionType": "openEnded",
+                  "value": "Replaced kitchen circuits; customer walked through the panel labels."
+                }
+              ]
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/connecteam-checklist-submitted",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ignored · duplicate_submission (Connecteam retry of sub-ct-0003)"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-webhook-secret": "wrong-fictional-secret",
+            "user-agent": "Connecteam-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "requestId": "req-fixture-sub-ct-0008",
+            "company": "Fictional Field Services Co",
+            "activityType": "forms",
+            "eventType": "form_submission",
+            "eventTimestamp": 1794909705,
+            "data": {
+              "formSubmissionId": "sub-ct-0008",
+              "formId": 7003,
+              "submissionTimestamp": 1794909700,
+              "submissionStartTimestamp": 1794908800,
+              "submissionTimezone": "America/Chicago",
+              "entryNum": 8,
+              "submittingUserId": 501,
+              "isAnonymous": false,
+              "answers": [
+                {
+                  "questionId": 301,
+                  "questionType": "openEnded",
+                  "value": "JOB-10422"
+                },
+                {
+                  "questionId": 304,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                }
+              ]
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/connecteam-checklist-submitted",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT rejected · secret_mismatch"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-webhook-secret": "sandbox-fictional-connecteam-secret-not-for-production",
+            "user-agent": "Connecteam-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "requestId": "req-fixture-sub-ct-0009",
+            "company": "Fictional Field Services Co",
+            "activityType": "forms",
+            "eventType": "form_submission",
+            "eventTimestamp": 1794909805,
+            "data": {
+              "formSubmissionId": "sub-ct-0009",
+              "formId": 9999,
+              "submissionTimestamp": 1794909800,
+              "submissionStartTimestamp": 1794908900,
+              "submissionTimezone": "America/Chicago",
+              "entryNum": 9,
+              "submittingUserId": 501,
+              "isAnonymous": false,
+              "answers": [
+                {
+                  "questionId": 1,
+                  "questionType": "openEnded",
+                  "value": "Lunch order"
+                }
+              ]
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/connecteam-checklist-submitted",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ignored · form_not_configured (formId 9999)"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-webhook-secret": "sandbox-fictional-connecteam-secret-not-for-production",
+            "user-agent": "Connecteam-Webhooks (fictional sandbox fixture)"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "requestId": "req-fixture-sub-ct-0010",
+            "company": "Fictional Field Services Co",
+            "activityType": "forms",
+            "eventType": "form_submission_edited",
+            "eventTimestamp": 1794909905,
+            "data": {
+              "formSubmissionId": "sub-ct-0010",
+              "formId": 7003,
+              "submissionTimestamp": 1794909900,
+              "submissionStartTimestamp": 1794909000,
+              "submissionTimezone": "America/Chicago",
+              "entryNum": 10,
+              "submittingUserId": 501,
+              "isAnonymous": false,
+              "answers": [
+                {
+                  "questionId": 301,
+                  "questionType": "openEnded",
+                  "value": "job-10422"
+                },
+                {
+                  "questionId": 302,
+                  "questionType": "openEnded",
+                  "value": "418 Willow Creek Drive"
+                },
+                {
+                  "questionId": 303,
+                  "questionType": "phoneNumber",
+                  "value": "(555) 010-0142"
+                },
+                {
+                  "questionId": 304,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 305,
+                  "questionType": "yesNo",
+                  "selectedIndex": 0
+                },
+                {
+                  "questionId": 306,
+                  "questionType": "multipleChoice",
+                  "selectedAnswers": [
+                    {
+                      "text": "20A breaker"
+                    },
+                    {
+                      "text": "12/2 Romex"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 307,
+                  "questionType": "number",
+                  "inputValue": 6.5
+                },
+                {
+                  "questionId": 308,
+                  "questionType": "group",
+                  "answers": [
+                    {
+                      "questionId": 309,
+                      "questionType": "task",
+                      "isChecked": true
+                    }
+                  ]
+                },
+                {
+                  "questionId": 310,
+                  "questionType": "image",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/image-1.jpg"
+                    },
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/image-2.jpg"
+                    },
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/image-3.jpg"
+                    },
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/image-4.jpg"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 311,
+                  "questionType": "signature",
+                  "images": [
+                    {
+                      "url": "https://files.connecteam.example/sandbox/sub-ct-0003/signature-1.jpg"
+                    }
+                  ]
+                },
+                {
+                  "questionId": 312,
+                  "questionType": "openEnded",
+                  "value": "Replaced kitchen circuits; customer walked through the panel labels."
+                }
+              ]
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/connecteam-checklist-submitted",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ignored · event_type_not_processed (form_submission_edited)"
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "UTC"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "author": "DH Robin (dhRobin Systems)",
+    "license": "MIT"
+  }
+}
